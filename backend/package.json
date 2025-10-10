@@ -1,0 +1,17 @@
+{
+  "name": "workshop-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.2",
+    "express": "^4.19.2",
+    "morgan": "^1.10.1",
+    "mysql2": "^3.14.4",
+    "nanoid": "^5.1.5"
+  }
+}
