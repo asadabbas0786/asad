@@ -3,91 +3,10 @@ import { pool } from "../db.js";
 
 const router = Router();
 
-/**
- * POST /api/bookings
- * Body: {
- *   slotId: number,
- *   name: string,
- *   email?: string,
- *   mobile_no?: string,
- *   seats: number[],             // seat ids to book
- *   amount_paid: number,
- *   payment_ref?: string
-//  * }
-//  * Creates booking + booking_seats. If any seat already booked for that slot, 409.
-//  */
-// router.post("/", async (req, res) => {
-//   const { slotId, name, email, mobile_no, seats = [], amount_paid, payment_ref } = req.body || {};
-
-//   if (!slotId || !name || !Array.isArray(seats) || seats.length < 1) {
-//     return res.status(400).json({ error: "slotId, name and seats[] are required" });
-//   }
-
-//   const conn = await pool.getConnection();
-//   try {
-//     await conn.beginTransaction();
-
-//     // Find slot & center
-//     const [[slot]] = await conn.query(
-//       `SELECT id, center_id FROM slots WHERE id = ?`,
-//       [slotId]
-//     );
-//     if (!slot) {
-//       await conn.rollback();
-//       return res.status(404).json({ error: "Slot not found" });
-//     }
-
-//     // Validate seats belong to the same center
-//     const placeholders = seats.map(() => "?").join(",");
-//     const [owned] = await conn.query(
-//       `
-//       SELECT id FROM seats
-//       WHERE center_id = ? AND id IN (${placeholders})
-//       `,
-//       [slot.center_id, ...seats]
-//     );
-//     if (owned.length !== seats.length) {
-//       await conn.rollback();
-//       return res.status(400).json({ error: "One or more seats do not belong to this slot's center" });
-//     }
-
-//     // Insert booking
-//     const [ins] = await conn.query(
-//       `
-//       INSERT INTO bookings (slot_id, name, email, mobile_no, amount_paid, currency, status, payment_ref)
-//       VALUES (?, ?, ?, ?, ?, 'INR', 'CONFIRMED', ?)
-//       `,
-//       [slotId, name, email || null, mobile_no || null, amount_paid ?? 0, payment_ref || null]
-//     );
-//     const bookingId = ins.insertId;
-
-//     // Insert booking seats; rely on UNIQUE(slot_id, seat_id) to prevent double-book
-//     const values = seats.map(seatId => [bookingId, slotId, seatId, null]);
-//     try {
-//       await conn.query(
-//         `INSERT INTO booking_seats (booking_id, slot_id, seat_id, seat_price) VALUES ?`,
-//         [values]
-//       );
-//     } catch (e) {
-//       // duplicate means some seat already booked for this slot
-//       await conn.rollback();
-//       return res.status(409).json({ error: "One or more seats already booked for this slot" });
-//     }
-
-//     await conn.commit();
-//     res.status(201).json({ bookingId, amount: amount_paid ?? 0 });
-//   } catch (err) {
-//     await conn.rollback();
-//     res.status(500).json({ error: "BOOKING_CREATE_FAILED" });
-//   } finally {
-//     conn.release();
-//   }
-// });
-
 router.post("/", async (req, res) => {
   const { slotId, name, email, mobile_no, amount_paid, payment_ref } = req.body || {};
 
-  // Normalize seat(s): allow seatId OR seats:[]
+  // Normalize seat(s) - expect single seat per request
   let seats = [];
   if (Array.isArray(req.body?.seats)) seats = req.body.seats;
   else if (req.body?.seatId != null) seats = [req.body.seatId];
@@ -101,13 +20,21 @@ router.post("/", async (req, res) => {
     return res.status(400).json({ error: "Invalid seat id" });
   }
 
+  const mobile = (mobile_no || "").toString().trim() || null;
+  const mail = (email || "").toString().trim() || null;
+
+  // Require at least one unique identifier: mobile_no or email
+  if (!mobile && !mail) {
+    return res.status(400).json({ error: "mobile_no or email is required and must be unique" });
+  }
+
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
 
-    // 1) Slot & center
+    // 1) Fetch slot (and center info + session_date)
     const [[slot]] = await conn.query(
-      `SELECT id, center_id, price, status FROM slots WHERE id = ? LIMIT 1`,
+      `SELECT id, center_id, price, status, session_date FROM slots WHERE id = ? LIMIT 1`,
       [slotId]
     );
     if (!slot) {
@@ -119,8 +46,39 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Slot is not available" });
     }
 
-    // 2) Ensure this is one of the 6 mini-slot seats for that center
-    // (idempotently create if missing)
+    // 2) ENFORCE daily booking limit: count seats already booked by this mobile_no or email on same session_date
+    const identityParts = [];
+    const identityParams = [slot.session_date]; // first param is session_date
+
+    if (mobile) {
+      identityParts.push("b.mobile_no = ?");
+      identityParams.push(mobile);
+    }
+    if (mail) {
+      identityParts.push("b.email = ?");
+      identityParams.push(mail);
+    }
+    const identityClause = "(" + identityParts.join(" OR ") + ")";
+
+    const countQuery = `
+      SELECT COUNT(bs.id) AS cnt
+      FROM bookings b
+      JOIN booking_seats bs ON bs.booking_id = b.id
+      JOIN slots s ON b.slot_id = s.id
+      WHERE s.session_date = ? AND ${identityClause} AND (b.status IS NULL OR b.status <> 'CANCELLED')
+    `;
+    const [[countRow]] = await conn.query(countQuery, identityParams);
+    const alreadyBookedSeats = Number(countRow?.cnt ?? 0);
+
+    if (alreadyBookedSeats >= 3) {
+      await conn.rollback();
+      return res.status(403).json({
+        error: "DAILY_LIMIT_REACHED",
+        message: `You already have ${alreadyBookedSeats} booked seat(s) on ${slot.session_date}. Maximum 3 seats per person per day allowed.`
+      });
+    }
+
+    // 3) Ensure mini-slot seats exist (idempotent create)
     await conn.query(
       `
       INSERT INTO seats (center_id, row_label, col_number, seat_type, base_price, is_active)
@@ -134,6 +92,7 @@ router.post("/", async (req, res) => {
       [slot.center_id, slot.center_id]
     );
 
+    // 4) Validate seat belongs to this center and is MS 1..6
     const [[validSeat]] = await conn.query(
       `
       SELECT id, col_number
@@ -148,18 +107,18 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ error: "Seat does not belong to this slot's center or is not a mini-slot seat" });
     }
 
-    // 3) Create booking
-    const effectiveAmount = (amount_paid == null ? slot.price : amount_paid);
+    // 5) Create booking
+    const effectiveAmount = (amount_paid == null ? slot.price : Number(amount_paid));
     const [ins] = await conn.query(
       `
       INSERT INTO bookings (slot_id, name, email, mobile_no, amount_paid, currency, status, payment_ref)
       VALUES (?, ?, ?, ?, ?, 'INR', 'CONFIRMED', ?)
       `,
-      [slotId, name, email || null, mobile_no || null, effectiveAmount, payment_ref || null]
+      [slotId, name, mail || null, mobile || null, effectiveAmount, payment_ref || null]
     );
     const bookingId = ins.insertId;
 
-    // 4) Link single seat (UNIQUE(slot_id, seat_id) avoids double booking)
+    // 6) Link single seat (UNIQUE(slot_id, seat_id) avoids double booking)
     try {
       await conn.query(
         `INSERT INTO booking_seats (booking_id, slot_id, seat_id, seat_price) VALUES (?, ?, ?, ?)`,
@@ -167,50 +126,21 @@ router.post("/", async (req, res) => {
       );
     } catch (e) {
       await conn.rollback();
-      if (e.code === "ER_DUP_ENTRY") {
+      if (e && e.code === "ER_DUP_ENTRY") {
         return res.status(409).json({ error: "Seat already booked for this slot" });
       }
+      console.error("booking_seat insert failed:", e);
       return res.status(500).json({ error: "BOOKING_SEAT_LINK_FAILED" });
     }
 
     await conn.commit();
-    res.status(201).json({ bookingId, amount: effectiveAmount });
+    return res.status(201).json({ bookingId, amount: effectiveAmount });
   } catch (err) {
-    await conn.rollback();
-    res.status(500).json({ error: "BOOKING_CREATE_FAILED" });
+    try { await conn.rollback(); } catch (er) { /* noop */ }
+    console.error("BOOKING_CREATE_FAILED:", err);
+    return res.status(500).json({ error: "BOOKING_CREATE_FAILED" });
   } finally {
     conn.release();
-  }
-});
-
-
-
-
-/** GET /api/bookings/:id -> booking + seats */
-router.get("/:id", async (req, res) => {
-  const { id } = req.params;
-  try {
-    const [[b]] = await pool.query(`SELECT * FROM bookings WHERE id = ?`, [id]);
-    if (!b) return res.status(404).json({ error: "Not found" });
-
-    const [items] = await pool.query(
-      `
-      SELECT
-        bs.seat_id,
-        s.row_label AS rowLabel,
-        s.col_number AS colNumber,
-        bs.seat_price
-      FROM booking_seats bs
-      JOIN seats s ON s.id = bs.seat_id
-      WHERE bs.booking_id = ?
-      ORDER BY s.row_label, s.col_number
-      `,
-      [id]
-    );
-
-    res.json({ ...b, seats: items });
-  } catch (err) {
-    res.status(500).json({ error: "BOOKING_FETCH_FAILED" });
   }
 });
 
