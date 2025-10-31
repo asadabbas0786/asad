@@ -28,20 +28,15 @@ ChartJS.register(
 );
 
 // --- BACKEND CONFIG ---
-// main app API (unchanged)
+// Main backend (simulation data) = port 8000
 const API_BASE =
   (typeof import.meta !== "undefined" &&
     import.meta.env &&
     import.meta.env.VITE_API_BASE) ||
-  (typeof window !== "undefined" ? window.location.origin : "http://localhost:8000");
+  "http://localhost:8000";
 const COUNT_URL = `${API_BASE.replace(/\/$/, "")}/count`;
 const POLL_MS = 1500;
 const MAX_HISTORY = 20;
-
-// ANGLE backend via nginx proxy (same origin). nginx proxies /api_new/ -> 127.0.0.1:8001
-const ANGLE_PREFIX =
-  (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_ANGLE_BASE) ||
-  (typeof window !== "undefined" ? window.location.origin + "/api_new" : "http://localhost:8001");
 
 function Sidebar({ onLogout }) {
   return (
@@ -75,123 +70,10 @@ function StatCard({ label, value, color = "text-gray-800" }) {
   );
 }
 
-/* ----------------- Client Camera Panel -----------------
-   opens browser camera, preview, sends single frames to server
-   uses ANGLE_PREFIX + "/api/process_frame" (proxied via nginx)
----------------------------------------------------------*/
-function ClientCameraPanel({ processFrameUrl = ANGLE_PREFIX + "/api/process_frame" }) {
-  const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const [stream, setStream] = useState(null);
-  const [status, setStatus] = useState("stopped");
-  const [facing, setFacing] = useState("environment"); // environment | user
-
-  async function startCamera() {
-    setStatus("requesting");
-    try {
-      const constraints = { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false };
-      let s;
-      try {
-        s = await navigator.mediaDevices.getUserMedia(constraints);
-      } catch (err) {
-        // fallback to any camera
-        s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      }
-      setStream(s);
-      if (videoRef.current) {
-        videoRef.current.srcObject = s;
-        videoRef.current.play().catch(() => {});
-      }
-      setStatus("running");
-    } catch (err) {
-      console.error("getUserMedia error:", err);
-      setStatus("error: " + (err.message || err.name));
-    }
-  }
-
-  function stopCamera() {
-    if (stream) {
-      stream.getTracks().forEach(t => t.stop());
-      setStream(null);
-    }
-    if (videoRef.current) {
-      videoRef.current.pause();
-      videoRef.current.srcObject = null;
-    }
-    setStatus("stopped");
-  }
-
-  function toggleFacing() {
-    setFacing(prev => (prev === "environment" ? "user" : "environment"));
-    stopCamera();
-    setTimeout(startCamera, 150);
-  }
-
-  async function captureAndSend() {
-    if (!videoRef.current) return setStatus("no-video");
-    const video = videoRef.current;
-    const canvas = canvasRef.current || document.createElement("canvas");
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
-    const ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    canvas.toBlob(async (blob) => {
-      if (!blob) {
-        setStatus("capture-failed");
-        return;
-      }
-      const form = new FormData();
-      form.append("frame", blob, "frame.jpg");
-      try {
-        setStatus("sending");
-        const resp = await fetch(processFrameUrl, { method: "POST", body: form, credentials: "same-origin" });
-        if (!resp.ok) {
-          const text = await resp.text();
-          setStatus(`server ${resp.status}: ${text}`);
-        } else {
-          const json = await resp.json();
-          setStatus("sent: ok");
-          console.log("process_frame result:", json);
-        }
-      } catch (err) {
-        console.error("send error:", err);
-        setStatus("send-failed: " + err.message);
-      }
-    }, "image/jpeg", 0.9);
-  }
-
-  useEffect(() => {
-    return () => stopCamera();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  return (
-    <div className="p-3 bg-white/5 rounded">
-      <h4 className="mb-2">Client Camera</h4>
-      <video
-        ref={videoRef}
-        className="w-[320px] h-auto bg-black rounded"
-        playsInline
-        muted
-        autoPlay
-      />
-      <div className="mt-2 flex gap-2">
-        <button onClick={startCamera} className="px-3 py-1 rounded bg-indigo-600">Start</button>
-        <button onClick={stopCamera} className="px-3 py-1 rounded bg-gray-600">Stop</button>
-        <button onClick={toggleFacing} className="px-3 py-1 rounded bg-yellow-600">Toggle Camera</button>
-        <button onClick={captureAndSend} className="px-3 py-1 rounded bg-green-600">Send Frame</button>
-      </div>
-      <div className="mt-2 text-xs text-gray-300">Status: {status}</div>
-      <canvas ref={canvasRef} style={{ display: "none" }} />
-    </div>
-  );
-}
-
-/* ----------------- Main Dashboard ----------------- */
 export default function Dashboard() {
   const user = getUser() || { name: "User" };
   const navigate = useNavigate();
+
   const [latest, setLatest] = useState(null);
   const [prickHistory, setPrickHistory] = useState([]);
   const [expertHistory, setExpertHistory] = useState([]);
@@ -209,13 +91,16 @@ export default function Dashboard() {
         const res = await fetch(COUNT_URL, { cache: "no-store" });
         if (!res.ok) return console.error("Failed to fetch /count", res.status);
         const data = await res.json();
+
         const prick = data.prick_count ?? null;
         const expert = data.expert_pressure ?? null;
         const avg = data.avg_force_g ?? null;
         const acc = data.accuracy_percent ?? null;
         const dur = data.duration_ms ?? null;
         const fsr = data.fsr_value ?? null;
+
         if (!mounted) return;
+
         setLatest({
           prick_count: prick,
           expert_pressure: expert,
@@ -225,6 +110,7 @@ export default function Dashboard() {
           fsr_value: fsr,
           timestamp: data.timestamp,
         });
+
         if (prick !== null && lastSeenRef.current.prick_count !== prick) {
           setPrickHistory((p) => [...p, prick].slice(-MAX_HISTORY));
           setExpertHistory((p) => [...p, expert].slice(-MAX_HISTORY));
@@ -236,6 +122,7 @@ export default function Dashboard() {
         console.error("Error fetching /count:", err);
       }
     }
+
     fetchCount();
     const id = setInterval(fetchCount, POLL_MS);
     return () => {
@@ -244,29 +131,23 @@ export default function Dashboard() {
     };
   }, []);
 
-  // --- YOLOv8 Syringe Angle Detection Integration (via ANGLE_PREFIX) ---
+  // --- YOLOv8 Syringe Angle Detection Integration (Port 8001) ---
   const [angleStatus, setAngleStatus] = useState({});
   const [snapshotUrl, setSnapshotUrl] = useState("");
 
   useEffect(() => {
     const interval = setInterval(() => {
-      fetch(`${ANGLE_PREFIX}/api/status`, { cache: "no-store" })
-        .then((res) => {
-          if (!res.ok) return { ready: false };
-          return res.json();
-        })
+      fetch("http://localhost:8001/api/status")
+        .then((res) => res.json())
         .then((data) => setAngleStatus(data))
-        .catch((err) => {
-          console.warn("status fetch error:", err);
-          setAngleStatus({ ready: false });
-        });
+        .catch(() => setAngleStatus({ ready: false }));
     }, 1000);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setSnapshotUrl(`${ANGLE_PREFIX}/api/snapshot?cacheBust=${Date.now()}`);
+      setSnapshotUrl(`http://localhost:8001/api/snapshot?cacheBust=${Date.now()}`);
     }, 1000);
     return () => clearInterval(interval);
   }, []);
@@ -525,10 +406,8 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* Right column: Client camera panel + Gauge Selector + Detection Stats */}
+              {/* --- Gauge Selector + Detection Stats --- */}
               <div className="flex flex-col gap-4 w-full md:w-auto">
-                <ClientCameraPanel />
-
                 {/* Gauge Selector */}
                 <div className="p-3 bg-gray-50 rounded-xl shadow-inner">
                   <label htmlFor="gauge-select" className="block text-sm text-gray-600 mb-2">
@@ -540,6 +419,17 @@ export default function Dashboard() {
                     onChange={async (e) => {
                       const v = e.target.value;
                       setNeedleGauge(v);
+
+                      // OPTIONAL: notify backend if you add an endpoint
+                      // try {
+                      //   await fetch("http://localhost:8001/api/gauge", {
+                      //     method: "POST",
+                      //     headers: { "Content-Type": "application/json" },
+                      //     body: JSON.stringify({ gauge: v }),
+                      //   });
+                      // } catch (err) {
+                      //   console.warn("Failed to notify backend about gauge:", err);
+                      // }
                     }}
                     className="w-full md:w-44 px-3 py-2 rounded border border-gray-200 bg-white text-gray-800"
                   >
