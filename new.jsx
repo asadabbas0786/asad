@@ -28,15 +28,19 @@ ChartJS.register(
 );
 
 // --- BACKEND CONFIG ---
-// Main backend (simulation data) = port 8000
 const API_BASE =
   (typeof import.meta !== "undefined" &&
     import.meta.env &&
     import.meta.env.VITE_API_BASE) ||
-  "http://localhost:8000";
+  (typeof window !== "undefined" ? window.location.origin : "http://localhost:8000");
 const COUNT_URL = `${API_BASE.replace(/\/$/, "")}/count`;
 const POLL_MS = 1500;
 const MAX_HISTORY = 20;
+
+// ANGLE backend via nginx proxy: /api_new -> 127.0.0.1:8001
+const ANGLE_PREFIX =
+  (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.VITE_ANGLE_BASE) ||
+  (typeof window !== "undefined" ? window.location.origin + "/api_new" : "http://localhost:8001");
 
 function Sidebar({ onLogout }) {
   return (
@@ -70,10 +74,193 @@ function StatCard({ label, value, color = "text-gray-800" }) {
   );
 }
 
+/* Client Camera Panel with Overlay (sends frames to /api_new/api/process_frame) */
+function ClientCameraPanelWithOverlay({
+  processFrameUrl = ANGLE_PREFIX + "/api/process_frame",
+  snapshotUrlBase = ANGLE_PREFIX + "/api/snapshot",
+  intervalMs = 600,
+}) {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const overlayRef = useRef(null);
+  const [stream, setStream] = useState(null);
+  const [status, setStatus] = useState("stopped");
+  const [processing, setProcessing] = useState(false);
+  const [facing, setFacing] = useState("environment");
+  const procTimer = useRef(null);
+
+  async function startCamera() {
+    setStatus("requesting");
+    try {
+      const constraints = { video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false };
+      let s;
+      try {
+        s = await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (err) {
+        s = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+      setStream(s);
+      if (videoRef.current) {
+        videoRef.current.srcObject = s;
+        await videoRef.current.play().catch(() => {});
+      }
+      setStatus("running");
+    } catch (err) {
+      console.error("getUserMedia error:", err);
+      setStatus("error: " + (err.message || err.name));
+    }
+  }
+
+  function stopCamera() {
+    if (procTimer.current) {
+      clearInterval(procTimer.current);
+      procTimer.current = null;
+    }
+    setProcessing(false);
+    if (stream) {
+      stream.getTracks().forEach((t) => t.stop());
+      setStream(null);
+    }
+    if (videoRef.current) {
+      videoRef.current.pause();
+      videoRef.current.srcObject = null;
+    }
+    setStatus("stopped");
+    if (overlayRef.current) overlayRef.current.src = "";
+  }
+
+  function toggleFacing() {
+    setFacing((p) => (p === "environment" ? "user" : "environment"));
+    stopCamera();
+    setTimeout(startCamera, 150);
+  }
+
+  function captureFrameBlob() {
+    if (!videoRef.current) return null;
+    const video = videoRef.current;
+    const canvas = canvasRef.current || document.createElement("canvas");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 480;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return new Promise((resolve) => {
+      canvas.toBlob((blob) => resolve(blob), "image/jpeg", 0.8);
+    });
+  }
+
+  async function sendOneFrame() {
+    const blob = await captureFrameBlob();
+    if (!blob) {
+      setStatus("no-frame");
+      return;
+    }
+    const form = new FormData();
+    form.append("frame", blob, "frame.jpg");
+    try {
+      setStatus("sending");
+      const resp = await fetch(processFrameUrl, { method: "POST", body: form, credentials: "same-origin" });
+      if (!resp.ok) {
+        setStatus(`server ${resp.status}`);
+        setTimeout(() => refreshSnapshotOverlay(), 300);
+        return;
+      }
+      const j = await resp.json();
+      if (j?.annotated) {
+        // server returned annotated data URL
+        if (overlayRef.current) overlayRef.current.src = j.annotated;
+      } else if (j?.saved) {
+        setTimeout(() => refreshSnapshotOverlay(), 200);
+      } else {
+        // fallback to polling snapshot
+        setTimeout(() => refreshSnapshotOverlay(), 200);
+      }
+      setStatus("sent");
+    } catch (err) {
+      console.error("send error:", err);
+      setStatus("send-failed");
+      setTimeout(() => refreshSnapshotOverlay(), 300);
+    }
+  }
+
+  function refreshSnapshotOverlay() {
+    const url = `${snapshotUrlBase}?cacheBust=${Date.now()}`;
+    if (overlayRef.current) overlayRef.current.src = url;
+  }
+
+  function startProcessing() {
+    if (processing) return;
+    setProcessing(true);
+    procTimer.current = setInterval(() => {
+      sendOneFrame();
+    }, intervalMs);
+  }
+  function stopProcessing() {
+    if (procTimer.current) {
+      clearInterval(procTimer.current);
+      procTimer.current = null;
+    }
+    setProcessing(false);
+  }
+  function toggleProcessing() {
+    if (processing) stopProcessing();
+    else startProcessing();
+  }
+
+  useEffect(() => {
+    return () => {
+      if (procTimer.current) clearInterval(procTimer.current);
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="p-3 bg-white/5 rounded">
+      <h4 className="mb-2">Client Camera (Live w/ Overlay)</h4>
+      <div style={{ position: "relative", width: 640, height: 480, background: "#000" }}>
+        <video
+          ref={videoRef}
+          style={{ width: "640px", height: "480px", objectFit: "cover", display: "block" }}
+          playsInline
+          muted
+          autoPlay
+        />
+        <img
+          ref={overlayRef}
+          src=""
+          alt="overlay"
+          style={{
+            position: "absolute",
+            top: 0,
+            left: 0,
+            width: 640,
+            height: 480,
+            pointerEvents: "none",
+          }}
+        />
+      </div>
+
+      <div className="mt-2 flex gap-2">
+        <button onClick={startCamera} className="px-3 py-1 rounded bg-indigo-600">Start</button>
+        <button onClick={stopCamera} className="px-3 py-1 rounded bg-gray-600">Stop</button>
+        <button onClick={toggleFacing} className="px-3 py-1 rounded bg-yellow-600">Toggle</button>
+
+        <button onClick={() => sendOneFrame()} className="px-3 py-1 rounded bg-blue-600">Send One</button>
+        <button onClick={toggleProcessing} className={`px-3 py-1 rounded ${processing ? "bg-red-600" : "bg-green-600"}`}>
+          {processing ? "Stop Live" : "Start Live"}
+        </button>
+      </div>
+
+      <div className="mt-2 text-xs text-gray-300">Status: {status} {processing ? "(live)" : ""}</div>
+      <canvas ref={canvasRef} style={{ display: "none" }} />
+    </div>
+  );
+}
+
+/* ----------------- Main Dashboard ----------------- */
 export default function Dashboard() {
   const user = getUser() || { name: "User" };
   const navigate = useNavigate();
-
   const [latest, setLatest] = useState(null);
   const [prickHistory, setPrickHistory] = useState([]);
   const [expertHistory, setExpertHistory] = useState([]);
@@ -131,23 +318,29 @@ export default function Dashboard() {
     };
   }, []);
 
-  // --- YOLOv8 Syringe Angle Detection Integration (Port 8001) ---
+  // --- YOLOv8 Syringe Angle Detection Integration (via ANGLE_PREFIX) ---
   const [angleStatus, setAngleStatus] = useState({});
   const [snapshotUrl, setSnapshotUrl] = useState("");
 
   useEffect(() => {
     const interval = setInterval(() => {
-      fetch("http://localhost:8001/api/status")
-        .then((res) => res.json())
+      fetch(`${ANGLE_PREFIX}/api/status`, { cache: "no-store" })
+        .then((res) => {
+          if (!res.ok) return { ready: false };
+          return res.json();
+        })
         .then((data) => setAngleStatus(data))
-        .catch(() => setAngleStatus({ ready: false }));
+        .catch((err) => {
+          console.warn("status fetch error:", err);
+          setAngleStatus({ ready: false });
+        });
     }, 1000);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setSnapshotUrl(`http://localhost:8001/api/snapshot?cacheBust=${Date.now()}`);
+      setSnapshotUrl(`${ANGLE_PREFIX}/api/snapshot?cacheBust=${Date.now()}`);
     }, 1000);
     return () => clearInterval(interval);
   }, []);
@@ -406,8 +599,10 @@ export default function Dashboard() {
                 )}
               </div>
 
-              {/* --- Gauge Selector + Detection Stats --- */}
+              {/* Right column: Client camera panel + Gauge Selector + Detection Stats */}
               <div className="flex flex-col gap-4 w-full md:w-auto">
+                <ClientCameraPanelWithOverlay />
+
                 {/* Gauge Selector */}
                 <div className="p-3 bg-gray-50 rounded-xl shadow-inner">
                   <label htmlFor="gauge-select" className="block text-sm text-gray-600 mb-2">
@@ -419,17 +614,6 @@ export default function Dashboard() {
                     onChange={async (e) => {
                       const v = e.target.value;
                       setNeedleGauge(v);
-
-                      // OPTIONAL: notify backend if you add an endpoint
-                      // try {
-                      //   await fetch("http://localhost:8001/api/gauge", {
-                      //     method: "POST",
-                      //     headers: { "Content-Type": "application/json" },
-                      //     body: JSON.stringify({ gauge: v }),
-                      //   });
-                      // } catch (err) {
-                      //   console.warn("Failed to notify backend about gauge:", err);
-                      // }
                     }}
                     className="w-full md:w-44 px-3 py-2 rounded border border-gray-200 bg-white text-gray-800"
                   >
